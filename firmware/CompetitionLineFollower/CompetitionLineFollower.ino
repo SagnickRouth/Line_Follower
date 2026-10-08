@@ -197,7 +197,6 @@ static int16_t clampSpeed(int16_t value) {
   if (value < -maxSpeed) return -maxSpeed;
   return value;
 }
-
 static void saveSettings() {
   prefs.begin("lf-robot", false);
   prefs.putFloat("kp", kp);
@@ -266,30 +265,28 @@ static void setupMotors() {
   pinMode(PIN_MOTOR_R_IN2, OUTPUT);
   pinMode(PIN_MOTOR_STBY, OUTPUT);
 
-  ledcSetup(PWM_CH_L, PWM_FREQ, PWM_BITS);
-  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_BITS);
-  ledcAttachPin(PIN_MOTOR_L_PWM, PWM_CH_L);
-  ledcAttachPin(PIN_MOTOR_R_PWM, PWM_CH_R);
+  ledcAttachChannel(PIN_MOTOR_L_PWM, PWM_FREQ, PWM_BITS, PWM_CH_L);
+  ledcAttachChannel(PIN_MOTOR_R_PWM, PWM_FREQ, PWM_BITS, PWM_CH_R);
 
   digitalWrite(PIN_MOTOR_STBY, HIGH);
 }
 
-static void setOneMotor(uint8_t pwmChannel, uint8_t in1, uint8_t in2, int16_t speed, bool invert) {
+static void setOneMotor(uint8_t pwmPin, uint8_t in1, uint8_t in2, int16_t speed, bool invert) {
   if (invert) speed = -speed;
   speed = constrain(speed, -(int16_t)PWM_MAX, (int16_t)PWM_MAX);
 
   if (speed > 0) {
     digitalWrite(in1, HIGH);
     digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, speed);
+    ledcWrite(pwmPin, speed);
   } else if (speed < 0) {
     digitalWrite(in1, LOW);
     digitalWrite(in2, HIGH);
-    ledcWrite(pwmChannel, -speed);
+    ledcWrite(pwmPin, -speed);
   } else {
     digitalWrite(in1, LOW);
     digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, 0);
+    ledcWrite(pwmPin, 0);
   }
 }
 
@@ -298,7 +295,7 @@ static void setMotors(int16_t left, int16_t right) {
   right = clampSpeed(right);
 
   setOneMotor(
-    PWM_CH_L,
+    PIN_MOTOR_L_PWM,
     PIN_MOTOR_L_IN1,
     PIN_MOTOR_L_IN2,
     left,
@@ -306,7 +303,7 @@ static void setMotors(int16_t left, int16_t right) {
   );
 
   setOneMotor(
-    PWM_CH_R,
+    PIN_MOTOR_R_PWM,
     PIN_MOTOR_R_IN1,
     PIN_MOTOR_R_IN2,
     right,
@@ -398,7 +395,6 @@ static int32_t readLinePosition(uint16_t *lineStrength) {
 static bool isNarrowLine(uint16_t strength) {
   return strength >= LINE_LOST_THRESHOLD && strength < LINE_WIDE_THRESHOLD;
 }
-
 static bool isColorInversionCandidate(uint16_t currentStrength) {
   const uint16_t invertedStrength = SENSOR_COUNT * 1000 - currentStrength;
 
@@ -597,8 +593,7 @@ static void handleButtons() {
     if (editing) {
       if (selectedMenu != MENU_SENSOR_VIEW) adjustSelected(1);
     } else {
-      selectedMenu = (MenuItem)((selectedMenu + 1) % MENU_COUNT);
-    }
+      selectedMenu = (MenuItem)((selectedMenu + 1) % MENU_COUNT);    }
   }
 
   if (pressed(BTN_PREV)) {
@@ -798,7 +793,6 @@ static void drawSensorView() {
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
     int16_t x = i * 8 + 1;
-
     uint8_t barHeight = map(
       sensorNorm[i],
       0,
@@ -997,7 +991,6 @@ static void runControlLoop() {
   lastControlAt += CONTROL_PERIOD_US;
 
   controlLoopCount++;
-
   uint16_t lineStrength = 0;
 
   int32_t position =
