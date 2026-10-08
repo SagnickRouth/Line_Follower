@@ -197,8 +197,7 @@ static int16_t clampSpeed(int16_t value) {
 
 static void saveSettings() {
   prefs.begin("lf-robot", false);
-  prefs.putFloat("kp", kp);
-  prefs.putFloat("ki", ki);
+  prefs.putFloat("kp", kp);  prefs.putFloat("ki", ki);
   prefs.putFloat("kd", kd);
   prefs.putShort("base", baseSpeed);
   prefs.putShort("max", maxSpeed);
@@ -258,30 +257,28 @@ static void setupMotors() {
   pinMode(PIN_MOTOR_R_IN2, OUTPUT);
   pinMode(PIN_MOTOR_STBY, OUTPUT);
 
-  ledcSetup(PWM_CH_L, PWM_FREQ, PWM_BITS);
-  ledcSetup(PWM_CH_R, PWM_FREQ, PWM_BITS);
-  ledcAttachPin(PIN_MOTOR_L_PWM, PWM_CH_L);
-  ledcAttachPin(PIN_MOTOR_R_PWM, PWM_CH_R);
+  ledcAttachChannel(PIN_MOTOR_L_PWM, PWM_FREQ, PWM_BITS, PWM_CH_L);
+  ledcAttachChannel(PIN_MOTOR_R_PWM, PWM_FREQ, PWM_BITS, PWM_CH_R);
 
   digitalWrite(PIN_MOTOR_STBY, HIGH);
 }
 
-static void setOneMotor(uint8_t pwmChannel, uint8_t in1, uint8_t in2, int16_t speed, bool invert) {
+static void setOneMotor(uint8_t pwmPin, uint8_t in1, uint8_t in2, int16_t speed, bool invert) {
   if (invert) speed = -speed;
   speed = constrain(speed, -(int16_t)PWM_MAX, (int16_t)PWM_MAX);
 
   if (speed > 0) {
     digitalWrite(in1, HIGH);
     digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, speed);
+    ledcWrite(pwmPin, speed);
   } else if (speed < 0) {
     digitalWrite(in1, LOW);
     digitalWrite(in2, HIGH);
-    ledcWrite(pwmChannel, -speed);
+    ledcWrite(pwmPin, -speed);
   } else {
     digitalWrite(in1, LOW);
     digitalWrite(in2, LOW);
-    ledcWrite(pwmChannel, 0);
+    ledcWrite(pwmPin, 0);
   }
 }
 
@@ -290,7 +287,7 @@ static void setMotors(int16_t left, int16_t right) {
   right = clampSpeed(right);
 
   setOneMotor(
-    PWM_CH_L,
+    PIN_MOTOR_L_PWM,
     PIN_MOTOR_L_IN1,
     PIN_MOTOR_L_IN2,
     left,
@@ -298,7 +295,7 @@ static void setMotors(int16_t left, int16_t right) {
   );
 
   setOneMotor(
-    PWM_CH_R,
+    PIN_MOTOR_R_PWM,
     PIN_MOTOR_R_IN1,
     PIN_MOTOR_R_IN2,
     right,
@@ -397,8 +394,7 @@ static void setupButtons() {
     }
 
     button.stable = digitalRead(button.pin);
-    button.previousStable = button.stable;
-    button.rawLast = button.stable;
+    button.previousStable = button.stable;    button.rawLast = button.stable;
   }
 }
 
@@ -597,7 +593,6 @@ static void handleButtons() {
       saveSettings();
     }
   }
-
   if (pressed(BTN_NEXT)) {
     if (editing) {
       if (selectedMenu != MENU_SENSOR_VIEW) {
@@ -797,8 +792,7 @@ static void drawMenuCarousel() {
 }
 
 static void drawSensorView() {
-  uint16_t lineStrength = 0;
-  int32_t position = readLinePosition(&lineStrength);
+  uint16_t lineStrength = 0;  int32_t position = readLinePosition(&lineStrength);
   uint8_t strongest = 0;
 
   for (uint8_t i = 1; i < SENSOR_COUNT; i++) {
@@ -997,8 +991,7 @@ static void updateDisplay() {
     if (
       now - lastStopPressedAt <
       START_MESSAGE_MS
-    ) {
-      drawStartBanner(
+    ) {      drawStartBanner(
         "STOP PRESSED",
         "Motors stopped"
       );
@@ -1197,13 +1190,3 @@ void loop() {
     mode ==
     MODE_RUNNING
   ) {
-
-    runControlLoop();
-
-  } else {
-
-    stopMotors();
-  }
-
-  updateDisplay();
-}
