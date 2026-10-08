@@ -297,20 +297,11 @@ static bool detectSideBranch() {
 }
 
 static bool deadEndConditionsReady(
-  int32_t position,
-  uint16_t lineStrength,
   uint32_t nowMs
 ) {
-  const int32_t center =
-    (SENSOR_COUNT - 1) * 1000 / 2;
-
-  const bool centered =
-    abs(position - center) <=
-    DEAD_END_CENTER_TOLERANCE;
-
-  const bool strong =
-    lineStrength >= DEAD_END_MIN_STRENGTH;
-
+  // The strong/centered condition must come from the last valid line frame.
+  // At this point the current frame is already line-less, so using the
+  // current line strength here would make dead-end detection impossible.
   const bool recentCenteredStrong =
     centeredStrongLineAt != 0 &&
     nowMs - centeredStrongLineAt <=
@@ -322,7 +313,6 @@ static bool deadEndConditionsReady(
       DEAD_END_MEMORY_MS;
 
   return recentCenteredStrong &&
-         strong &&
          !recentSideBranch;
 }
 
@@ -395,7 +385,9 @@ static bool serviceUTurn(
     if (nowMs - uTurnLineSeenAt >=
         UTURN_REACQUIRE_MS) {
 
-      motorStop();
+      setMotors(0, 0);
+      motorEnable();
+
       maneuverState = MANEUVER_NORMAL;
       lastLineSeenAt = nowMs;
 
@@ -1590,8 +1582,6 @@ static void runControlFrame() {
     // no recent left/right branch. Confirm the absence before turning.
     if (!deadEndCandidate &&
         deadEndConditionsReady(
-          lastPosition,
-          lastLineStrength,
           nowMs
         ) &&
         !sideBranchPresent) {
