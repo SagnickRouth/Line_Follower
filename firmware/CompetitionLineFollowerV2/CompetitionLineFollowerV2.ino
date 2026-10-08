@@ -77,6 +77,22 @@ static const uint32_t CALIBRATION_TIME_MS = 5000;
 static const uint32_t LINE_GAP_HOLD_MS = 100;
 static const uint32_t LOST_LINE_SEARCH_MS = 900;
 
+// Dead-end detection / U-turn maneuver.
+// A dead end is confirmed only when the line was recently strong and centered,
+// no side branch was recently seen, and the line remains absent long enough.
+// This avoids treating ordinary sharp corners as dead ends.
+static const uint32_t DEAD_END_CONFIRM_MS = 220;
+static const uint32_t DEAD_END_MEMORY_MS = 180;
+static const uint16_t DEAD_END_CENTER_TOLERANCE = 1600;
+static const uint16_t DEAD_END_MIN_STRENGTH = 1400;
+static const uint16_t DEAD_END_SIDE_THRESHOLD = 550;
+static const uint8_t DEAD_END_SIDE_SENSORS = 3;
+
+static const uint32_t UTURN_MIN_MS = 280;
+static const uint32_t UTURN_REACQUIRE_MS = 45;
+static const uint32_t UTURN_MAX_MS = 1500;
+static const int16_t UTURN_POWER = 520;
+
 static const uint32_t START_RAMP_MS = 500;
 static const uint16_t START_MIN_POWER = 250;
 
@@ -134,6 +150,11 @@ enum RunMode {
   MODE_RUNNING,
   MODE_CALIBRATING,
   MODE_FAULT
+};
+
+enum ManeuverState {
+  MANEUVER_NORMAL,
+  MANEUVER_UTURN
 };
 
 enum MenuItem {
@@ -203,6 +224,17 @@ int16_t lastDriveRight = 0;
 int8_t forkPreference = 0;
 uint32_t forkPreferenceUntil = 0;
 
+// Dead-end / U-turn state.
+ManeuverState maneuverState = MANEUVER_NORMAL;
+uint32_t centeredStrongLineAt = 0;
+uint32_t lastSideBranchAt = 0;
+uint32_t deadEndCandidateAt = 0;
+bool deadEndCandidate = false;
+uint32_t uTurnStartedAt = 0;
+uint32_t uTurnLineSeenAt = 0;
+int8_t uTurnDirection = 1;
+uint32_t deadEndCount = 0;
+
 uint32_t lastStartPressedAt = 0;
 uint32_t lastStopPressedAt = 0;
 uint32_t calibrationStartedAt = 0;
@@ -239,6 +271,168 @@ uint8_t activeSensorCount = 0;
 float lastConfidence = 0.0f;
 
 uint32_t controlOverrunAt = 0;
+
+// -----------------------------------------------------------------------------
+// Dead-end detection / U-turn helpers
+// -----------------------------------------------------------------------------
+
+static bool detectSideBranch() {
+  uint8_t leftCount = 0;
+  uint8_t rightCount = 0;
+
+  for (uint8_t i = 0; i < DEAD_END_SIDE_SENSORS; i++) {
+    if (sensorNorm[i] >= DEAD_END_SIDE_THRESHOLD) {
+      leftCount++;
+    }
+
+    const uint8_t rightIndex =
+      SENSOR_COUNT - 1 - i;
+
+    if (sensorNorm[rightIndex] >= DEAD_END_SIDE_THRESHOLD) {
+      rightCount++;
+    }
+  }
+
+  return leftCount > 0 || rightCount > 0;
+}
+
+static bool deadEndConditionsReady(
+  int32_t position,
+  uint16_t lineStrength,
+  uint32_t nowMs
+) {
+  const int32_t center =
+    (SENSOR_COUNT - 1) * 1000 / 2;
+
+  const bool centered =
+    abs(position - center) <=
+    DEAD_END_CENTER_TOLERANCE;
+
+  const bool strong =
+    lineStrength >= DEAD_END_MIN_STRENGTH;
+
+  const bool recentCenteredStrong =
+    centeredStrongLineAt != 0 &&
+    nowMs - centeredStrongLineAt <=
+      DEAD_END_MEMORY_MS;
+
+  const bool recentSideBranch =
+    lastSideBranchAt != 0 &&
+    nowMs - lastSideBranchAt <=
+      DEAD_END_MEMORY_MS;
+
+  return recentCenteredStrong &&
+         strong &&
+         !recentSideBranch;
+}
+
+static void resetManeuverState() {
+  maneuverState = MANEUVER_NORMAL;
+  deadEndCandidate = false;
+  deadEndCandidateAt = 0;
+  uTurnStartedAt = 0;
+  uTurnLineSeenAt = 0;
+  uTurnDirection = 1;
+}
+
+static void beginUTurn(int8_t direction) {
+  maneuverState = MANEUVER_UTURN;
+  uTurnStartedAt = millis();
+  uTurnLineSeenAt = 0;
+  uTurnDirection =
+    direction < 0 ? -1 : 1;
+
+  // A U-turn must start from a clean PID state.
+  integral = 0.0f;
+  derivativeFiltered = 0.0f;
+  lastError = 0.0f;
+  forkPreference = 0;
+  forkPreferenceUntil = 0;
+
+  deadEndCandidate = false;
+  deadEndCandidateAt = 0;
+  deadEndCount++;
+
+  Serial.println(
+    F("DEAD END: confirmed, starting 180-degree turn.")
+  );
+}
+
+static bool serviceUTurn(
+  bool linePresent,
+  float confidence,
+  uint32_t nowMs
+) {
+  if (maneuverState != MANEUVER_UTURN) {
+    return false;
+  }
+
+  const uint32_t elapsed =
+    nowMs - uTurnStartedAt;
+
+  // The minimum rotation prevents immediately reacquiring the old line
+  // and cancelling the maneuver before the robot has turned enough.
+  if (elapsed < UTURN_MIN_MS) {
+    setMotors(
+      -uTurnDirection * UTURN_POWER,
+      uTurnDirection * UTURN_POWER
+    );
+
+    lastDriveLeft =
+      -uTurnDirection * UTURN_POWER;
+
+    lastDriveRight =
+      uTurnDirection * UTURN_POWER;
+
+    return true;
+  }
+
+  if (linePresent && confidence >= 0.25f) {
+    if (uTurnLineSeenAt == 0) {
+      uTurnLineSeenAt = nowMs;
+    }
+
+    if (nowMs - uTurnLineSeenAt >=
+        UTURN_REACQUIRE_MS) {
+
+      motorStop();
+      maneuverState = MANEUVER_NORMAL;
+      lastLineSeenAt = nowMs;
+
+      Serial.println(
+        F("U-TURN: line reacquired.")
+      );
+
+      return true;
+    }
+  } else {
+    uTurnLineSeenAt = 0;
+  }
+
+  if (elapsed >= UTURN_MAX_MS) {
+    motorStop();
+    mode = MODE_FAULT;
+
+    Serial.println(
+      F("U-TURN FAILED: line not reacquired.")
+    );
+
+    return true;
+  }
+
+  setMotors(
+    -uTurnDirection * UTURN_POWER,
+    uTurnDirection * UTURN_POWER
+  );
+
+  lastDriveLeft =
+    -uTurnDirection * UTURN_POWER;
+
+  lastDriveRight =
+    uTurnDirection * UTURN_POWER;
+
+  return true;
+}
 
 // -----------------------------------------------------------------------------
 // Peripherals
@@ -497,8 +691,7 @@ static void updateCalibration() {
     }
 
     if (sensorRaw[i] > sensorMax[i]) {
-      sensorMax[i] = sensorRaw[i];    }
-  }
+      sensorMax[i] = sensorRaw[i];    }  }
 }
 
 static void beginCalibration() {
@@ -951,6 +1144,13 @@ static void handleButtons() {
         forkPreferenceUntil = 0;
         colorSwitchPending = false;
 
+        centeredStrongLineAt = 0;
+        lastSideBranchAt = 0;
+        deadEndCandidateAt = 0;
+        deadEndCandidate = false;
+        deadEndCount = 0;
+        resetManeuverState();
+
         frameCount = 0;
         controlOverrunCount = 0;
 
@@ -997,7 +1197,6 @@ static void handleButtons() {
         selectedMenu == MENU_SENSOR_VIEW) {
       editing = true;
     } else {      editing = !editing;
-
       if (!editing && settingsDirty) {
         saveSettings();
       }
@@ -1277,8 +1476,28 @@ static void runControlFrame() {
     ) &&
     confidence >= 0.15f;
 
+  const bool sideBranchPresent =
+    detectSideBranch();
+
   if (linePresent) {
     lastLineSeenAt = nowMs;
+
+    if (abs(
+          position -
+          (int32_t)((SENSOR_COUNT - 1) * 1000 / 2)
+        ) <= DEAD_END_CENTER_TOLERANCE &&
+        lineStrength >= DEAD_END_MIN_STRENGTH) {
+
+      centeredStrongLineAt = nowMs;
+    }
+
+    if (sideBranchPresent) {
+      lastSideBranchAt = nowMs;
+    }
+
+    // A confirmed line frame cancels a pending dead-end candidate.
+    deadEndCandidate = false;
+    deadEndCandidateAt = 0;
 
     updateForkPreference(
       position,
@@ -1323,7 +1542,27 @@ static void runControlFrame() {
   }
 
   // ---------------------------------------------------------------------------
-  // Line lost
+  // Dead-end / U-turn maneuver
+  // ---------------------------------------------------------------------------
+
+  if (serviceUTurn(
+        linePresent,
+        confidence,
+        nowMs
+      )) {
+
+    lastControlUs =
+      micros() - frameStart;
+
+    if (lastControlUs > maxControlUs) {
+      maxControlUs = lastControlUs;
+    }
+
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Line lost / dead-end detection
   // ---------------------------------------------------------------------------
 
   if (!linePresent) {
@@ -1336,6 +1575,55 @@ static void runControlFrame() {
         lastDriveLeft,
         lastDriveRight
       );
+
+      lastControlUs =
+        micros() - frameStart;
+
+      if (lastControlUs > maxControlUs) {
+        maxControlUs = lastControlUs;
+      }
+
+      return;
+    }
+
+    // A dead end is a centered, strong line that suddenly terminates with
+    // no recent left/right branch. Confirm the absence before turning.
+    if (!deadEndCandidate &&
+        deadEndConditionsReady(
+          lastPosition,
+          lastLineStrength,
+          nowMs
+        ) &&
+        !sideBranchPresent) {
+
+      deadEndCandidate = true;
+      deadEndCandidateAt = nowMs;
+
+      Serial.println(
+        F("DEAD END: candidate.")
+      );
+    }
+
+    if (deadEndCandidate &&
+        nowMs - deadEndCandidateAt >=
+          DEAD_END_CONFIRM_MS) {
+
+      // Turn toward the side where the line was last biased. If centered,
+      // default to the right.
+      const int32_t center =
+        (SENSOR_COUNT - 1) * 1000 / 2;
+
+      const int8_t direction =
+        lastPosition < center ? -1 : 1;
+
+      beginUTurn(direction);
+
+      lastControlUs =
+        micros() - frameStart;
+
+      if (lastControlUs > maxControlUs) {
+        maxControlUs = lastControlUs;
+      }
 
       return;
     }
@@ -1497,8 +1785,7 @@ static void showBootLogo() {
   display.clearDisplay();
   display.drawBitmap(
     (128 - 48) / 2,
-    0,
-    devtaLogoBitmap,
+    0,    devtaLogoBitmap,
     48,
     64,
     SSD1306_WHITE
@@ -1625,6 +1912,15 @@ static void drawDiagnostics() {
   display.setCursor(70, 54);
   display.print("S ");
   display.print(activeSensorCount);
+
+  display.setCursor(0, 63);
+  display.print(
+    maneuverState == MANEUVER_UTURN
+      ? "UTURN "
+      : "NORMAL "
+  );
+  display.print("DE ");
+  display.print(deadEndCount);
 }
 
 static void drawSensorView() {
@@ -1761,16 +2057,20 @@ static void updateDisplay() {
 
     display.setCursor(0, 54);
     display.print(
-      activeBlackLine ? "BLACK " : "WHITE "
+      maneuverState == MANEUVER_UTURN
+        ? "U-TURN"
+        : activeBlackLine ? "BLACK " : "WHITE "
     );
 
-    display.print(
-      forkPreference < 0
-        ? "FORK L"
-        : forkPreference > 0
-          ? "FORK R"
-          : "FORK -"
-    );
+    if (maneuverState != MANEUVER_UTURN) {
+      display.print(
+        forkPreference < 0
+          ? "FORK L"
+          : forkPreference > 0
+            ? "FORK R"
+            : "FORK -"
+      );
+    }
 
   } else if (mode == MODE_CALIBRATING) {
 
@@ -1914,7 +2214,17 @@ static void updateTelemetry() {
   Serial.print(lastLineStrength);
 
   Serial.print(F(" peak="));
-  Serial.println(lastPeakStrength);
+  Serial.print(lastPeakStrength);
+
+  Serial.print(F(" deadEnds="));
+  Serial.print(deadEndCount);
+
+  Serial.print(F(" maneuver="));
+  Serial.println(
+    maneuverState == MANEUVER_UTURN
+      ? F("UTURN")
+      : F("NORMAL")
+  );
 }
 
 // -----------------------------------------------------------------------------
