@@ -262,6 +262,23 @@ int8_t uTurnDirection = 1;
 uint32_t deadEndCount = 0;
 
 
+// The maze implementation lives before the diagnostics block, so these
+// variables are declared here explicitly and defined later in the file.
+extern uint32_t lastFrameAt;
+extern uint32_t frameCount;
+extern uint32_t controlOverrunCount;
+extern uint32_t controlOverrunAt;
+extern uint32_t lastFramePeriodUs;
+extern uint32_t minFramePeriodUs;
+extern uint32_t maxFramePeriodUs;
+extern float measuredHz;
+extern uint32_t lastControlUs;
+extern uint32_t maxControlUs;
+extern uint16_t lastLineStrength;
+extern uint16_t lastPeakStrength;
+extern uint8_t activeSensorCount;
+extern float lastConfidence;
+
 // Forward declarations for the maze layer. Keeping these explicit avoids
 // relying on Arduino's automatic prototype generation for this larger FSM.
 static void setMotors(int16_t left, int16_t right);
