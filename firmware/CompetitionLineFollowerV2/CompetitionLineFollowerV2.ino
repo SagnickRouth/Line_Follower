@@ -971,7 +971,7 @@ static void handleButtons() {
       }
     } else if (mode == MODE_FAULT) {
 
-      // START acts as an acknowledge after a fault.
+      // START acknowledges a recoverable fault.
       if (calibrationLooksValid()) {
         mode = MODE_IDLE;
         Serial.println(F("Fault acknowledged."));
@@ -979,13 +979,14 @@ static void handleButtons() {
     }
   }
 
-  if (buttons[BTN_START].stable == HIGH) {
-    startButtonLocked = false;
+  // Calibration must remain available after a calibration-related fault.
+  if (pressed(BTN_CAL) &&
+      (mode == MODE_IDLE || mode == MODE_FAULT)) {
+    beginCalibration();
   }
 
-  if (pressed(BTN_CAL) &&
-      mode == MODE_IDLE) {
-    beginCalibration();
+  if (buttons[BTN_START].stable == HIGH) {
+    startButtonLocked = false;
   }
 
   if (mode != MODE_IDLE) {
@@ -1252,7 +1253,19 @@ static void runControlFrame() {
       lastPosition = position;
     }
 
+    // Recompute peak/count/confidence after polarity changes so the
+    // line-present decision uses the new sensor polarity.
+    updateLineMetrics(
+      &lineStrength,
+      &peakStrength,
+      &activeCount,
+      &confidence
+    );
+
     lastLineStrength = lineStrength;
+    lastPeakStrength = peakStrength;
+    activeSensorCount = activeCount;
+    lastConfidence = confidence;
   }
 
   const bool linePresent =
@@ -1346,17 +1359,10 @@ static void runControlFrame() {
     const int16_t turn =
       calculateLostLineTurn();
 
-    if (turn < 0) {
-      setMotors(
-        -turn,
-        turn
-      );
-    } else {
-      setMotors(
-        -turn,
-        turn
-      );
-    }
+    setMotors(
+      -turn,
+      turn
+    );
 
     lastDriveLeft = -turn;
     lastDriveRight = turn;
