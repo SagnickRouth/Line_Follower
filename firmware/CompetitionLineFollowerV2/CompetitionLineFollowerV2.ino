@@ -261,6 +261,31 @@ uint32_t uTurnLineSeenAt = 0;
 int8_t uTurnDirection = 1;
 uint32_t deadEndCount = 0;
 
+
+// Forward declarations for the maze layer. Keeping these explicit avoids
+// relying on Arduino's automatic prototype generation for this larger FSM.
+static void setMotors(int16_t left, int16_t right);
+static void motorStop();
+static void motorEnable();
+static uint32_t readSensors();
+static void normalizeSensors(bool lineIsBlack);
+static bool updateLineMetrics(
+  uint16_t *lineStrength,
+  uint16_t *peakStrength,
+  uint8_t *activeCount,
+  float *confidence
+);
+static int32_t calculatePosition(
+  uint16_t *lineStrength,
+  uint16_t *peakStrength,
+  uint8_t *activeCount,
+  float *confidence
+);
+static bool isColorInversionCandidate(uint16_t currentStrength);
+static bool updateLinePolarity(uint16_t *lineStrength);
+static int16_t clampSpeed(int16_t value);
+static int16_t calculatePidCorrection(float error, float dt);
+
 /*
  * ---------------------------------------------------------------------------
  * Maze solver state
@@ -292,7 +317,6 @@ bool mazeStraightAvailable = false;
 
 uint32_t mazeProbeStartedAt = 0;
 uint32_t mazeTurnStartedAt = 0;
-uint32_t mazeTurnClearUntil = 0;
 uint32_t mazeLineSeenAt = 0;
 uint32_t mazeJunctionLockUntil = 0;
 uint32_t mazeDeadEndStartedAt = 0;
@@ -317,7 +341,6 @@ static void resetMazeState() {
 
   mazeProbeStartedAt = 0;
   mazeTurnStartedAt = 0;
-  mazeTurnClearUntil = 0;
   mazeLineSeenAt = 0;
   mazeJunctionLockUntil = 0;
   mazeDeadEndStartedAt = 0;
@@ -452,8 +475,6 @@ static void mazeBeginTurn(MazeTurn turn) {
   mazeTurn = turn;
   mazeState = MAZE_TURNING;
   mazeTurnStartedAt = millis();
-  mazeTurnClearUntil =
-    mazeTurnStartedAt + MAZE_TURN_CLEAR_MS;
   mazeLineSeenAt = 0;
 
   integral = 0.0f;
@@ -500,8 +521,7 @@ static void mazeChooseAndTurn() {
 }
 
 static bool mazeServiceTurn(
-  uint16_t lineStrength,
-  uint8_t activeCount
+  uint16_t lineStrength
 ) {
   if (mazeState != MAZE_TURNING) {
     return false;
@@ -704,7 +724,7 @@ static void runMazeFrame() {
     mazeGoalStartedAt = 0;
   }
 
-  if (mazeServiceTurn(lineStrength, activeCount)) {
+  if (mazeServiceTurn(lineStrength)) {
     lastControlUs = micros() - frameStart;
     if (lastControlUs > maxControlUs) {
       maxControlUs = lastControlUs;
@@ -2678,7 +2698,6 @@ static void updateDisplay() {
       display.print("Hz");
     }
 
-    display.print(measuredHz, 0);
     display.setCursor(0, 12);
     display.print("Base ");
     display.print(baseSpeed);
