@@ -93,6 +93,29 @@ static const uint32_t UTURN_REACQUIRE_MS = 45;
 static const uint32_t UTURN_MAX_MS = 1500;
 static const int16_t UTURN_POWER = 520;
 
+// Maze solver configuration. The maze mode is a separate navigation layer
+// above the same sensor/PID/motor drivers. It is intended for taped line mazes.
+// The exploration pass uses a left-hand rule and records L/S/R/B moves. The
+// recorded path is reduced with LSRB rules whenever a dead-end B is added.
+static const uint32_t MAZE_JUNCTION_DEBOUNCE_MS = 180;
+static const uint32_t MAZE_PROBE_MS = 90;
+static const uint32_t MAZE_TURN_CLEAR_MS = 90;
+static const uint32_t MAZE_LINE_REACQUIRE_MS = 35;
+static const uint32_t MAZE_TURN_TIMEOUT_MS = 900;
+static const uint32_t MAZE_DEAD_END_CONFIRM_MS = 90;
+static const uint32_t MAZE_GOAL_CONFIRM_MS = 220;
+static const uint32_t MAZE_START_IGNORE_MS = 600;
+
+static const uint16_t MAZE_BRANCH_THRESHOLD = 500;
+static const uint8_t MAZE_BRANCH_SENSORS = 4;
+static const uint16_t MAZE_CENTER_THRESHOLD = 500;
+static const uint8_t MAZE_GOAL_SENSOR_COUNT = 14;
+static const uint16_t MAZE_GOAL_STRENGTH = 12500;
+static const int16_t MAZE_PROBE_SPEED = 300;
+static const int16_t MAZE_TURN_POWER = 500;
+
+static const uint8_t MAZE_MAX_PATH = 160;
+
 static const uint32_t START_RAMP_MS = 500;
 static const uint16_t START_MIN_POWER = 250;
 
@@ -138,6 +161,7 @@ int16_t baseSpeed = 420;
 int16_t maxSpeed = 850;
 
 bool blackLine = true;
+bool mazeModeEnabled = false;
 bool invertLeftMotor = false;
 bool invertRightMotor = false;
 
@@ -148,6 +172,7 @@ bool invertRightMotor = false;
 enum RunMode {
   MODE_IDLE,
   MODE_RUNNING,
+  MODE_MAZE_RUNNING,
   MODE_CALIBRATING,
   MODE_FAULT
 };
@@ -164,6 +189,7 @@ enum MenuItem {
   MENU_KI,
   MENU_KD,
   MENU_LINE_COLOR,
+  MENU_DRIVE_MODE,
   MENU_DIAGNOSTICS,
   MENU_SENSOR_VIEW,
   MENU_COUNT
@@ -234,6 +260,608 @@ uint32_t uTurnStartedAt = 0;
 uint32_t uTurnLineSeenAt = 0;
 int8_t uTurnDirection = 1;
 uint32_t deadEndCount = 0;
+
+/*
+ * ---------------------------------------------------------------------------
+ * Maze solver state
+ * ---------------------------------------------------------------------------
+ * This is intentionally independent of the normal competition dead-end /
+ * U-turn state machine above. Maze mode owns its own junction detection,
+ * branch selection, turning, path memory and goal handling.
+ */
+enum MazeState {
+  MAZE_FOLLOW,
+  MAZE_PROBE,
+  MAZE_TURNING,
+  MAZE_FINISHED
+};
+
+enum MazeTurn {
+  MAZE_TURN_NONE,
+  MAZE_TURN_LEFT,
+  MAZE_TURN_RIGHT,
+  MAZE_TURN_BACK
+};
+
+MazeState mazeState = MAZE_FOLLOW;
+MazeTurn mazeTurn = MAZE_TURN_NONE;
+
+bool mazeLeftAvailable = false;
+bool mazeRightAvailable = false;
+bool mazeStraightAvailable = false;
+
+uint32_t mazeProbeStartedAt = 0;
+uint32_t mazeTurnStartedAt = 0;
+uint32_t mazeTurnClearUntil = 0;
+uint32_t mazeLineSeenAt = 0;
+uint32_t mazeJunctionLockUntil = 0;
+uint32_t mazeDeadEndStartedAt = 0;
+uint32_t mazeGoalStartedAt = 0;
+uint32_t mazeStartAt = 0;
+
+uint16_t mazeJunctionCount = 0;
+uint16_t mazeDeadEndCount = 0;
+uint16_t mazePathLength = 0;
+
+char mazePath[MAZE_MAX_PATH + 1];
+bool mazeGoalReached = false;
+bool mazeFault = false;
+
+static void resetMazeState() {
+  mazeState = MAZE_FOLLOW;
+  mazeTurn = MAZE_TURN_NONE;
+
+  mazeLeftAvailable = false;
+  mazeRightAvailable = false;
+  mazeStraightAvailable = false;
+
+  mazeProbeStartedAt = 0;
+  mazeTurnStartedAt = 0;
+  mazeTurnClearUntil = 0;
+  mazeLineSeenAt = 0;
+  mazeJunctionLockUntil = 0;
+  mazeDeadEndStartedAt = 0;
+  mazeGoalStartedAt = 0;
+  mazeStartAt = millis();
+
+  mazeJunctionCount = 0;
+  mazeDeadEndCount = 0;
+  mazePathLength = 0;
+
+  mazePath[0] = '\0';
+  mazeGoalReached = false;
+  mazeFault = false;
+}
+
+static void mazeAppendMove(char move) {
+  if (mazePathLength >= MAZE_MAX_PATH) {
+    mazeFault = true;
+    mode = MODE_FAULT;
+    motorStop();
+    Serial.println(F("MAZE FAULT: path memory full."));
+    return;
+  }
+
+  mazePath[mazePathLength++] = move;
+  mazePath[mazePathLength] = '\0';
+}
+
+static char mazeReduceTriple(char a, char b, char c) {
+  if (b != 'B') return 0;
+
+  // Relative turn angles:
+  // L=-90, S=0, R=+90, B=180.
+  int angle = 0;
+
+  auto turnAngle = [](char x) -> int {
+    if (x == 'L') return 270;
+    if (x == 'R') return 90;
+    if (x == 'B') return 180;
+    return 0;
+  };
+
+  angle = (turnAngle(a) + 180 + turnAngle(c)) % 360;
+
+  if (angle == 0) return 'S';
+  if (angle == 90) return 'R';
+  if (angle == 180) return 'B';
+  if (angle == 270) return 'L';
+
+  return 0;
+}
+
+static void mazeSimplifyPath() {
+  bool changed = true;
+
+  while (changed && mazePathLength >= 3) {
+    changed = false;
+
+    for (uint16_t i = 0; i + 2 < mazePathLength; i++) {
+      char replacement = mazeReduceTriple(
+        mazePath[i],
+        mazePath[i + 1],
+        mazePath[i + 2]
+      );
+
+      if (replacement == 0) continue;
+
+      mazePath[i] = replacement;
+
+      for (uint16_t j = i + 1; j + 2 < mazePathLength; j++) {
+        mazePath[j] = mazePath[j + 2];
+      }
+
+      mazePathLength -= 2;
+      mazePath[mazePathLength] = '\0';
+
+      changed = true;
+      break;
+    }
+  }
+}
+
+static void mazePrintPath() {
+  Serial.print(F("MAZE PATH="));
+  Serial.println(mazePath);
+}
+
+static bool mazeOuterBranch(bool left) {
+  const uint8_t start = left ? 0 : SENSOR_COUNT - MAZE_BRANCH_SENSORS;
+
+  uint8_t count = 0;
+
+  for (uint8_t n = 0; n < MAZE_BRANCH_SENSORS; n++) {
+    const uint8_t i = start + n;
+
+    if (sensorNorm[i] >= MAZE_BRANCH_THRESHOLD) {
+      count++;
+    }
+  }
+
+  return count >= 2;
+}
+
+static bool mazeCenterOnLine() {
+  const uint8_t centerLeft = SENSOR_COUNT / 2 - 1;
+  const uint8_t centerRight = SENSOR_COUNT / 2;
+
+  return sensorNorm[centerLeft] >= MAZE_CENTER_THRESHOLD ||
+         sensorNorm[centerRight] >= MAZE_CENTER_THRESHOLD;
+}
+
+static bool mazeWideJunctionCandidate() {
+  const bool left = mazeOuterBranch(true);
+  const bool right = mazeOuterBranch(false);
+
+  // A side branch is the strongest junction indication. A very wide line
+  // with multiple active sensors is also treated as a candidate, allowing
+  // T/cross intersections whose branch geometry spans the array.
+  return left ||
+         right ||
+         (activeSensorCount >= 8 &&
+          lastLineStrength >= 3500);
+}
+
+static bool mazeGoalCandidate() {
+  return millis() - mazeStartAt >= MAZE_START_IGNORE_MS &&
+         activeSensorCount >= MAZE_GOAL_SENSOR_COUNT &&
+         lastLineStrength >= MAZE_GOAL_STRENGTH;
+}
+
+static void mazeBeginTurn(MazeTurn turn) {
+  mazeTurn = turn;
+  mazeState = MAZE_TURNING;
+  mazeTurnStartedAt = millis();
+  mazeTurnClearUntil =
+    mazeTurnStartedAt + MAZE_TURN_CLEAR_MS;
+  mazeLineSeenAt = 0;
+
+  integral = 0.0f;
+  derivativeFiltered = 0.0f;
+  lastError = 0.0f;
+
+  if (turn == MAZE_TURN_LEFT) {
+    mazeAppendMove('L');
+  } else if (turn == MAZE_TURN_RIGHT) {
+    mazeAppendMove('R');
+  } else if (turn == MAZE_TURN_BACK) {
+    mazeAppendMove('B');
+    mazeDeadEndCount++;
+  }
+
+  if (mode == MODE_FAULT) return;
+
+  Serial.print(F("MAZE TURN "));
+  Serial.println(
+    turn == MAZE_TURN_LEFT ? F("LEFT") :
+    turn == MAZE_TURN_RIGHT ? F("RIGHT") :
+    F("BACK")
+  );
+}
+
+static void mazeChooseAndTurn() {
+  // Left-hand rule:
+  // LEFT > STRAIGHT > RIGHT > BACK.
+  // The recorded L/S/R/B path is reduced after every backtrack.
+  if (mazeLeftAvailable) {
+    mazeBeginTurn(MAZE_TURN_LEFT);
+  } else if (mazeStraightAvailable) {
+    mazeAppendMove('S');
+    mazeState = MAZE_FOLLOW;
+    mazeJunctionLockUntil =
+      millis() + MAZE_JUNCTION_DEBOUNCE_MS;
+
+    Serial.println(F("MAZE CHOICE STRAIGHT"));
+  } else if (mazeRightAvailable) {
+    mazeBeginTurn(MAZE_TURN_RIGHT);
+  } else {
+    mazeBeginTurn(MAZE_TURN_BACK);
+  }
+}
+
+static bool mazeServiceTurn(
+  uint16_t lineStrength,
+  uint8_t activeCount
+) {
+  if (mazeState != MAZE_TURNING) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  const uint32_t elapsed =
+    now - mazeTurnStartedAt;
+
+  if (elapsed < MAZE_TURN_CLEAR_MS) {
+    if (mazeTurn == MAZE_TURN_LEFT) {
+      setMotors(-MAZE_TURN_POWER, MAZE_TURN_POWER);
+    } else {
+      setMotors(MAZE_TURN_POWER, -MAZE_TURN_POWER);
+    }
+
+    return true;
+  }
+
+  const bool centerLine =
+    mazeCenterOnLine() &&
+    lineStrength >= LINE_LOST_THRESHOLD;
+
+  if (centerLine) {
+    if (mazeLineSeenAt == 0) {
+      mazeLineSeenAt = now;
+    }
+
+    if (now - mazeLineSeenAt >= MAZE_LINE_REACQUIRE_MS) {
+      setMotors(0, 0);
+      motorEnable();
+
+      mazeState = MAZE_FOLLOW;
+      mazeTurn = MAZE_TURN_NONE;
+      mazeJunctionLockUntil =
+        now + MAZE_JUNCTION_DEBOUNCE_MS;
+
+      if (mazePathLength > 0 &&
+          mazePath[mazePathLength - 1] == 'B') {
+        mazeSimplifyPath();
+      }
+
+      Serial.print(F("MAZE LINE REACQUIRED path="));
+      Serial.println(mazePath);
+
+      return true;
+    }
+  } else {
+    mazeLineSeenAt = 0;
+  }
+
+  if (elapsed >= MAZE_TURN_TIMEOUT_MS) {
+    motorStop();
+    mode = MODE_FAULT;
+    mazeFault = true;
+
+    Serial.println(
+      F("MAZE FAULT: turn timeout / line not reacquired.")
+    );
+
+    return true;
+  }
+
+  if (mazeTurn == MAZE_TURN_LEFT) {
+    setMotors(-MAZE_TURN_POWER, MAZE_TURN_POWER);
+  } else {
+    setMotors(MAZE_TURN_POWER, -MAZE_TURN_POWER);
+  }
+
+  return true;
+}
+
+static void mazeFinish() {
+  motorStop();
+
+  mazeState = MAZE_FINISHED;
+  mazeGoalReached = true;
+
+  // Remove dead-end excursions before presenting the final route.
+  mazeSimplifyPath();
+
+  Serial.println(F("===================================="));
+  Serial.println(F("MAZE SOLVED"));
+  mazePrintPath();
+  Serial.print(F("Junctions="));
+  Serial.println(mazeJunctionCount);
+  Serial.print(F("DeadEnds="));
+  Serial.println(mazeDeadEndCount);
+  Serial.print(F("PathLength="));
+  Serial.println(mazePathLength);
+  Serial.println(F("===================================="));
+}
+
+static void runMazeFrame() {
+  const uint32_t frameStart = micros();
+  const uint32_t nowUs = frameStart;
+
+  if (lastFrameAt != 0) {
+    lastFramePeriodUs = nowUs - lastFrameAt;
+
+    if (lastFramePeriodUs > 0) {
+      measuredHz =
+        1000000.0f / (float)lastFramePeriodUs;
+    }
+
+    if (lastFramePeriodUs < minFramePeriodUs) {
+      minFramePeriodUs = lastFramePeriodUs;
+    }
+
+    if (lastFramePeriodUs > maxFramePeriodUs) {
+      maxFramePeriodUs = lastFramePeriodUs;
+    }
+
+    if (lastFramePeriodUs > CONTROL_PERIOD_US * 2) {
+      controlOverrunCount++;
+      controlOverrunAt = millis();
+    }
+  }
+
+  lastFrameAt = nowUs;
+  frameCount++;
+
+  const uint32_t scanUs = readSensors();
+
+  if (scanUs >= CONTROL_PERIOD_US) {
+    controlOverrunCount++;
+    controlOverrunAt = millis();
+  }
+
+  normalizeSensors(activeBlackLine);
+
+  uint16_t lineStrength = 0;
+  uint16_t peakStrength = 0;
+  uint8_t activeCount = 0;
+  float confidence = 0.0f;
+
+  int32_t position = calculatePosition(
+    &lineStrength,
+    &peakStrength,
+    &activeCount,
+    &confidence
+  );
+
+  lastLineStrength = lineStrength;
+  lastPeakStrength = peakStrength;
+  activeSensorCount = activeCount;
+  lastConfidence = confidence;
+
+  const uint32_t nowMs = millis();
+
+  const bool inversionCandidate =
+    isColorInversionCandidate(lineStrength);
+
+  if (updateLinePolarity(&lineStrength)) {
+    uint32_t weightedSum = 0;
+    uint32_t sum = 0;
+
+    for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
+      weightedSum +=
+        (uint32_t)sensorNorm[i] *
+        (uint32_t)(i * 1000);
+      sum += sensorNorm[i];
+    }
+
+    if (sum > 0) {
+      position = weightedSum / sum;
+      lastPosition = position;
+    }
+
+    updateLineMetrics(
+      &lineStrength,
+      &peakStrength,
+      &activeCount,
+      &confidence
+    );
+
+    lastLineStrength = lineStrength;
+    lastPeakStrength = peakStrength;
+    activeSensorCount = activeCount;
+    lastConfidence = confidence;
+  }
+
+  if (mazeState == MAZE_FINISHED) {
+    motorStop();
+    lastControlUs = micros() - frameStart;
+    return;
+  }
+
+  if (mazeGoalCandidate()) {
+    if (mazeGoalStartedAt == 0) {
+      mazeGoalStartedAt = nowMs;
+    }
+
+    if (nowMs - mazeGoalStartedAt >= MAZE_GOAL_CONFIRM_MS) {
+      mazeFinish();
+      lastControlUs = micros() - frameStart;
+      return;
+    }
+  } else {
+    mazeGoalStartedAt = 0;
+  }
+
+  if (mazeServiceTurn(lineStrength, activeCount)) {
+    lastControlUs = micros() - frameStart;
+    if (lastControlUs > maxControlUs) {
+      maxControlUs = lastControlUs;
+    }
+    return;
+  }
+
+  if (mazeState == MAZE_PROBE) {
+    // Move beyond the junction so the center sensors can tell us whether
+    // the straight branch actually continues.
+    setMotors(MAZE_PROBE_SPEED, MAZE_PROBE_SPEED);
+
+    if (nowMs - mazeProbeStartedAt >= MAZE_PROBE_MS) {
+      mazeStraightAvailable =
+        mazeCenterOnLine() &&
+        lineStrength >= LINE_LOST_THRESHOLD;
+
+      mazeJunctionCount++;
+
+      mazeChooseAndTurn();
+
+      if (mode != MODE_FAULT &&
+          mazeState != MAZE_TURNING) {
+        mazeJunctionLockUntil =
+          nowMs + MAZE_JUNCTION_DEBOUNCE_MS;
+      }
+
+      lastControlUs = micros() - frameStart;
+      if (lastControlUs > maxControlUs) {
+        maxControlUs = lastControlUs;
+      }
+      return;
+    }
+
+    lastControlUs = micros() - frameStart;
+    if (lastControlUs > maxControlUs) {
+      maxControlUs = lastControlUs;
+    }
+    return;
+  }
+
+  if (nowMs >= mazeJunctionLockUntil &&
+      mazeWideJunctionCandidate()) {
+
+    mazeLeftAvailable = mazeOuterBranch(true);
+    mazeRightAvailable = mazeOuterBranch(false);
+
+    // At the first detection the center line cannot distinguish a T from a
+    // cross. The short forward probe resolves that ambiguity.
+    mazeStraightAvailable = true;
+    mazeProbeStartedAt = nowMs;
+    mazeState = MAZE_PROBE;
+
+    setMotors(
+      MAZE_PROBE_SPEED,
+      MAZE_PROBE_SPEED
+    );
+
+    lastControlUs = micros() - frameStart;
+    if (lastControlUs > maxControlUs) {
+      maxControlUs = lastControlUs;
+    }
+    return;
+  }
+
+  const bool linePresent =
+    peakStrength >= LINE_MIN_PEAK &&
+    lineStrength >= LINE_LOST_THRESHOLD &&
+    confidence >= 0.15f;
+
+  // Separate maze dead-end detection. Do not reuse the competition-mode
+  // dead-end state machine: maze mode needs the B path record.
+  if (!linePresent) {
+    if (mazeDeadEndStartedAt == 0) {
+      mazeDeadEndStartedAt = nowMs;
+    }
+
+    if (nowMs - mazeDeadEndStartedAt >=
+        MAZE_DEAD_END_CONFIRM_MS) {
+
+      mazeDeadEndStartedAt = 0;
+      mazeBeginTurn(MAZE_TURN_BACK);
+
+      lastControlUs = micros() - frameStart;
+      if (lastControlUs > maxControlUs) {
+        maxControlUs = lastControlUs;
+      }
+      return;
+    }
+
+    // Brief line gaps: continue with the previous command.
+    setMotors(lastDriveLeft, lastDriveRight);
+
+    lastControlUs = micros() - frameStart;
+    if (lastControlUs > maxControlUs) {
+      maxControlUs = lastControlUs;
+    }
+    return;
+  }
+
+  mazeDeadEndStartedAt = 0;
+  lastLineSeenAt = nowMs;
+
+  // Normal PID line following inside the maze.
+  const float dt =
+    constrain(
+      (lastFramePeriodUs > 0
+        ? lastFramePeriodUs * 1e-6f
+        : CONTROL_PERIOD_US * 1e-6f),
+      MIN_DT_S,
+      MAX_DT_S
+    );
+
+  const int32_t center =
+    (SENSOR_COUNT - 1) * 1000 / 2;
+
+  const float error =
+    (float)position - (float)center;
+
+  const int16_t correction =
+    calculatePidCorrection(error, dt);
+
+  const int16_t mazeBase =
+    min(baseSpeed, (int16_t)(maxSpeed * 0.75f));
+
+  int16_t left =
+    (int16_t)(mazeBase + correction);
+
+  int16_t right =
+    (int16_t)(mazeBase - correction);
+
+  const int16_t magnitude =
+    max(abs(left), abs(right));
+
+  if (magnitude > maxSpeed) {
+    const float scale =
+      (float)maxSpeed / (float)magnitude;
+    left = (int16_t)(left * scale);
+    right = (int16_t)(right * scale);
+  }
+
+  left = clampSpeed(left);
+  right = clampSpeed(right);
+
+  setMotors(left, right);
+
+  lastDriveLeft = left;
+  lastDriveRight = right;
+  lastError = error;
+
+  lastControlUs = micros() - frameStart;
+
+  if (lastControlUs > maxControlUs) {
+    maxControlUs = lastControlUs;
+  }
+}
+
 
 uint32_t lastStartPressedAt = 0;
 uint32_t lastStopPressedAt = 0;
@@ -469,6 +1097,7 @@ static void saveSettings() {
   prefs.putShort("base", baseSpeed);
   prefs.putShort("max", maxSpeed);
   prefs.putBool("black", blackLine);
+  prefs.putBool("maze", mazeModeEnabled);
   prefs.putBool("calOK", calibrationLooksValid());
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
@@ -497,6 +1126,7 @@ static void loadSettings() {
   maxSpeed = prefs.getShort("max", maxSpeed);
 
   blackLine = prefs.getBool("black", blackLine);
+  mazeModeEnabled = prefs.getBool("maze", mazeModeEnabled);
 
   for (uint8_t i = 0; i < SENSOR_COUNT; i++) {
     char keyMin[8];
@@ -1018,6 +1648,13 @@ static void adjustSelected(int8_t direction) {
       }
       break;
 
+    case MENU_DRIVE_MODE:
+      if (direction != 0) {
+        mazeModeEnabled = !mazeModeEnabled;
+        markSettingsDirty();
+      }
+      break;
+
     default:
       break;
   }
@@ -1031,6 +1668,7 @@ static const char *menuName(MenuItem item) {
     case MENU_KI: return "Ki";
     case MENU_KD: return "Kd";
     case MENU_LINE_COLOR: return "Line color";
+    case MENU_DRIVE_MODE: return "Drive mode";
     case MENU_DIAGNOSTICS: return "Diagnostics";
     case MENU_SENSOR_VIEW: return "Sensor view";
     default: return "";
@@ -1056,6 +1694,9 @@ static String menuValueText(MenuItem item) {
 
     case MENU_LINE_COLOR:
       return blackLine ? "Black" : "White";
+
+    case MENU_DRIVE_MODE:
+      return mazeModeEnabled ? "Maze" : "Line";
 
     case MENU_DIAGNOSTICS:
       return "Enter";
@@ -1095,7 +1736,8 @@ static void handleButtons() {
     editing = false;
     startButtonLocked = true;
 
-    if (mode == MODE_RUNNING) {
+    if (mode == MODE_RUNNING ||
+        mode == MODE_MAZE_RUNNING) {
 
       mode = MODE_IDLE;
       lastStopPressedAt = millis();
@@ -1119,8 +1761,6 @@ static void handleButtons() {
         motorStop();
 
       } else {
-
-        mode = MODE_RUNNING;
 
         lastStartPressedAt = millis();
         lastLineSeenAt = millis();
@@ -1153,12 +1793,19 @@ static void handleButtons() {
         maxSensorScanUs = 0;
 
         maxControlUs = 0;
-
         lastFrameAt = micros();
 
-        motorEnable();
+        resetMazeState();
 
-        Serial.println(F("V2 RUN START"));
+        if (mazeModeEnabled) {
+          mode = MODE_MAZE_RUNNING;
+          Serial.println(F("V2 MAZE RUN START"));
+        } else {
+          mode = MODE_RUNNING;
+          Serial.println(F("V2 LINE RUN START"));
+        }
+
+        motorEnable();
       }
     } else if (mode == MODE_FAULT) {
 
@@ -1357,6 +2004,11 @@ static int16_t calculateLostLineTurn() {
 // -----------------------------------------------------------------------------
 
 static void runControlFrame() {
+  if (mode == MODE_MAZE_RUNNING) {
+    runMazeFrame();
+    return;
+  }
+
   const uint32_t frameStart = micros();
 
   const uint32_t nowUs = frameStart;
@@ -2009,16 +2661,24 @@ static void updateDisplay() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
 
-  if (mode == MODE_RUNNING) {
+  if (mode == MODE_RUNNING ||
+      mode == MODE_MAZE_RUNNING) {
 
     display.setTextSize(1);
 
     display.setCursor(0, 0);
-    display.print("RUN V2 ");
+
+    if (mode == MODE_MAZE_RUNNING) {
+      display.print("MAZE ");
+      display.print(measuredHz, 0);
+      display.print("Hz");
+    } else {
+      display.print("RUN V2 ");
+      display.print(measuredHz, 0);
+      display.print("Hz");
+    }
 
     display.print(measuredHz, 0);
-    display.print("Hz");
-
     display.setCursor(0, 12);
     display.print("Base ");
     display.print(baseSpeed);
@@ -2052,7 +2712,23 @@ static void updateDisplay() {
         : activeBlackLine ? "BLACK " : "WHITE "
     );
 
-    if (maneuverState != MANEUVER_UTURN) {
+    if (mode == MODE_MAZE_RUNNING) {
+      display.print(" ");
+      display.print(
+        mazeState == MAZE_TURNING ? "TURN" :
+        mazeState == MAZE_PROBE ? "PROBE" :
+        mazeState == MAZE_FINISHED ? "DONE" :
+        "FOLLOW"
+      );
+
+      display.setCursor(0, 63);
+      display.print("J");
+      display.print(mazeJunctionCount);
+      display.print(" D");
+      display.print(mazeDeadEndCount);
+      display.print(" P");
+      display.print(mazePathLength);
+    } else if (maneuverState != MANEUVER_UTURN) {
       display.print(
         forkPreference < 0
           ? "FORK L"
@@ -2115,6 +2791,8 @@ static void updateDisplay() {
 
     if (!calibrationLooksValid()) {
       display.print("Calibration invalid");
+    } else if (mazeFault) {
+      display.print("Maze/safety stop");
     } else {
       display.print("Line/safety stop");
     }
@@ -2210,11 +2888,30 @@ static void updateTelemetry() {
   Serial.print(deadEndCount);
 
   Serial.print(F(" maneuver="));
-  Serial.println(
+  Serial.print(
     maneuverState == MANEUVER_UTURN
       ? F("UTURN")
       : F("NORMAL")
   );
+
+  Serial.print(F(" mode="));
+  Serial.print(
+    mode == MODE_MAZE_RUNNING ? F("MAZE") : F("LINE")
+  );
+
+  if (mode == MODE_MAZE_RUNNING ||
+      mazePathLength > 0) {
+    Serial.print(F(" mazeJ="));
+    Serial.print(mazeJunctionCount);
+    Serial.print(F(" mazeD="));
+    Serial.print(mazeDeadEndCount);
+    Serial.print(F(" mazeP="));
+    Serial.print(mazePathLength);
+    Serial.print(F(" path="));
+    Serial.print(mazePath);
+  }
+
+  Serial.println();
 }
 
 // -----------------------------------------------------------------------------
@@ -2316,6 +3013,12 @@ void setup() {
     F("Actual frequency will be measured.")
   );
   Serial.println(
+    F("Drive mode: menu -> Drive mode -> Line/Maze")
+  );
+  Serial.println(
+    F("Maze mode: left-hand exploration + LSRB path reduction.")
+  );
+  Serial.println(
     F("====================================")
   );
 
@@ -2339,7 +3042,8 @@ void loop() {
       finishCalibration();
     }
 
-  } else if (mode == MODE_RUNNING) {
+  } else if (mode == MODE_RUNNING ||
+             mode == MODE_MAZE_RUNNING) {
 
     serviceControl();
 
